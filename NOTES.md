@@ -1,5 +1,16 @@
 # Notes: Property Revenue Dashboard debugging
 
+## Summary
+| # | Complaint | Root cause | Fix | Commit |
+|---|---|---|---|---|
+| 0 | (hid all the others) | DB pool used non-existent settings, so every request fell back to mock numbers | Pool uses `DATABASE_URL`; async-compatible pool; `greenlet` | `2a9894e` |
+| 1 | Ocean sees another company's revenue | Revenue cache key had no tenant; `prop-001` exists for both tenants | Key `revenue:{tenant_id}:{property_id}` | `8ccf2e6` |
+| 2 | Sunset's March totals don't match | Month boundaries in UTC, not the property's time zone (Paris) | Compare `check_in_date AT TIME ZONE p.timezone` | `fe857d1` |
+| 3 | Totals off by a few cents | Total converted to `float` before rounding | Round the exact `Decimal` once, half-up, to cents | `3ee4c53` |
+| 4 | (wrong or other company's figures on DB errors) | Mock data left in the error path | Log the error and return 503 | `931ff30` |
+
+Details for each bug (found by / root cause / fix / proof) below.
+
 ## How to run
 ```
 docker compose up --build -d
@@ -27,13 +38,13 @@ docker compose exec backend python -m pytest
 - **Proof:** `tests/test_revenue_cache.py` fails without the fix (`assert 4 == 0`) and passes with it. Live: Sunset `prop-001` = 2250.0 / 4, Ocean `prop-001` = 0.0 / 0 on every refresh; Redis keys `revenue:tenant-a:prop-001` and `revenue:tenant-b:prop-001`.
 
 ### 2. Sunset's March totals don't match (FIXED)
-- **Found by:** reading the seed: `res-tz-1` (Sunset, `prop-001`, Paris) checks in 2024-02-29 23:30 UTC = **2024-03-01 00:30 in Paris**, a March booking. Querying March with UTC boundaries (what the code did) gives **1000.000**; Sunset's own records (Paris time) say **2250.000**. 1000.00 / 3 bookings is also exactly what Sunset saw while the mock fallback was active.
+- **Found by:** reading the seed: `res-tz-1` (Sunset, `prop-001`, Paris) checks in 2024-02-29 23:30 UTC = **2024-03-01 00:30 in Paris**, a March booking. Querying March with UTC boundaries (what the code did) gives **1000.000**; counting in Paris time, as the client does, gives **2250.000**. In the dashboard, Sunset saw **1000.00 / 3 bookings** for `prop-001` (the mock value, which equals March counted in UTC); after the fixes it shows **2,250.00 / 4**.
 - **Root cause:** `calculate_monthly_revenue` in `services/reservations.py` built month boundaries as naive UTC datetimes and ignored `properties.timezone`. It was also a stub (always returned 0) and its SQL used a `tenant_id` the function never received.
 - **Fix:** the existing function now runs its query (same `DatabasePool` + `text()` pattern as `calculate_total_revenue`), takes `tenant_id`, and compares `check_in_date AT TIME ZONE p.timezone` (joined from `properties`) against local month boundaries. Postgres does the time-zone conversion, including DST. Removed the debug `print`.
 - **Proof:** `tests/test_monthly_revenue.py`: March 2024 = 2250.000 (res-tz-1 included), February = 0, tenant-b's `prop-001` = 0, December rolls into the next year.
 
 ### 3. Totals off by a few cents (FIXED)
-- **Found by:** following the total from the database to the screen. `database/schema.sql` stores `total_amount NUMERIC(10,3)` (sub-cent, e.g. 333.333 + 333.333 + 333.334). `api/v1/dashboard.py` line 18 turns the exact `Decimal` total into a `float`. `frontend/src/components/RevenueSummary.tsx` then rounds that float again with `Math.round(x * 100) / 100`, and even has a "Precision Mismatch Detected" warning, so the original authors had seen the symptom.
+- **Found by:** following the total from the database to the screen. `database/schema.sql` stores `total_amount NUMERIC(10,3)` (sub-cent, e.g. 333.333 + 333.333 + 333.334). `api/v1/dashboard.py` (original line 18) turns the exact `Decimal` total into a `float`. `frontend/src/components/RevenueSummary.tsx` then rounds that float again with `Math.round(x * 100) / 100`, and even has a "Precision Mismatch Detected" warning, so the original authors had seen the symptom.
 - **Root cause:** money passes through binary floating point before it is rounded. A total like `1000.005` becomes the float `1000.00499…`, which rounds to **1000.00** instead of **1000.01**. Only totals that land on a half cent are affected, which matches "a few cents here and there, can't pin down when". Checked in the container: `round(float("1000.005"), 2)` = 1000.0, `Decimal("1000.005").quantize(0.01, ROUND_HALF_UP)` = 1000.01.
 - **Fix:** `dashboard.py` rounds the exact `Decimal` total once, to cents, half-up (`quantize(Decimal("0.01"), ROUND_HALF_UP)`), and only then converts it for JSON. The response field stays a number, so the frontend is unchanged.
 - **Proof:** `tests/test_dashboard_rounding.py` (unit test, auth and revenue service faked): on the original code 2 of 4 cases fail (`1000.005` is sent raw instead of `1000.01`; `4975.504` instead of `4975.50`); with the fix all pass. Live, all six properties match the seed sums (Sunset 2250.00 / 4975.50 / 6100.50; Ocean 0.00 / 1776.50 / 3256.00).
@@ -43,6 +54,18 @@ docker compose exec backend python -m pytest
 - **Root cause:** test-time mock data left in the production error path. It turns an outage into silently wrong numbers (Client A's complaint) and cross-tenant numbers (Client B's complaint), and it hid bug 0.
 - **Fix:** the service logs the error with `logger.exception(...)` (module logger, instead of `print`) and re-raises; the endpoint (`dashboard.py`, which already imported `HTTPException`) answers **503 "Revenue data temporarily unavailable"**. The frontend already shows "Failed to load revenue data" on errors. A failure is never cached, because the exception happens before the cache write.
 - **Proof:** `tests/test_revenue_errors.py`: on the original code both tests fail (service returned the mock: "DID NOT RAISE"; endpoint crashed with a 500); with the fix both pass. Live: stopped the DB, Ocean `prop-002` → `HTTP 503`, no figures; started the DB again → `0.00`, HTTP 200.
+
+### Checked in the UI with the provided client credentials (http://localhost:3000)
+| Property | Sunset (tenant-a) | Ocean (tenant-b) |
+|---|---|---|
+| prop-001 | USD 2,250.00 / 4 | USD 0.00 / 0 (right after Sunset loaded it: no leak) |
+| prop-002 | USD 4,975.50 / 4 | USD 0.00 / 0 |
+| prop-003 | USD 6,100.50 / 2 | USD 0.00 / 0 |
+| prop-004 | USD 0.00 / 0 | USD 1,776.50 / 4 |
+| prop-005 | USD 0.00 / 0 | USD 3,256.00 / 3 |
+
+All values match the seed sums; switching properties back and forth as Ocean never showed Sunset's figures.
+Seen but not caused by these fixes: after a couple of full page reloads the frontend sends the user back to the login page while every API call (including `/auth/me`) returned 200, so it is the frontend's own session handling. No auth or frontend code was changed here.
 
 ## Change log (every file touched)
 | File | What changed | Bug |
@@ -67,6 +90,7 @@ docker compose exec backend python -m pytest
 - Follow the repo's conventions: tests in `backend/tests/test_*.py` (pyproject `testpaths`, pre-commit `name-tests-test`), ruff, conventional commit messages (`fix: ...`).
 - Assignment says "do NOT rebuild, use existing patterns": every fix is the smallest change to existing code.
 - Did **not** add a property-ownership check (404) to the dashboard endpoint: new logic, and not needed once the DB works, because the existing SQL already filters by `tenant_id`. Ocean asking for `prop-002` gets its own 0, not Sunset's figure.
+- Final check: 13 tests pass; the repo's ruff hook (default rules, no config file) reports nothing new in the changed files. The only 2 findings (`asyncio` and `List` imported but unused) were already in the original code and are unrelated, so I left them.
 - Errors: 503 (temporary, retry later) rather than 500 or a fallback value; for financial figures, no number is better than a wrong one. The service raises, the API layer decides the HTTP status.
 - Rounding: half-up to cents, once, on the server (the usual rule for invoices); the frontend's own `Math.round` is left as is, since it now only ever receives 2-decimal values.
 - Tests for bugs 0–2 are integration tests against the compose services (no new test dependencies added to the repo); pytest installed in the container only to run them.
@@ -82,7 +106,14 @@ Not fixed, on purpose:
 - A reservation's revenue belongs to the month of its **check-in date in the property's local time** (as the original query intended: `check_in_date >= start AND < end`). Not split across nights.
 - `calculate_monthly_revenue` is not called by any endpoint yet; I fixed the function rather than adding a new endpoint (assignment: don't rebuild). Wiring it to a `month`/`year` dashboard parameter is a next step.
 
-## If I had more time
+## Recommended follow-ups (outside this bug-fix scope)
+Not done on purpose: these are refactors, features or team decisions rather than fixes for the reported bugs.
+1. Initialise the global DB pool once at app startup and reuse it, instead of a new engine per call.
+2. Wire `calculate_monthly_revenue` to the dashboard (`month`/`year` parameters) so clients see monthly figures in their own time zone.
+3. Add a "list my properties" endpoint and use it in `Dashboard.tsx`, instead of the hard-coded list of all 5 properties.
+4. Agree with the team how to total mixed currencies, then stop hard-coding `"USD"`.
+5. Look into the frontend sending users back to the login page after page reloads.
+6. Add the tests to CI (they need the compose Postgres and Redis), and remove the 2 pre-existing unused imports.
 
 ## Tools used
 Used Claude Code as a pair programmer. I made the design decisions, reviewed and approved every change, and can explain each one.
