@@ -26,7 +26,7 @@ def test_service_raises_instead_of_returning_mock_data(monkeypatch):
     monkeypatch.setattr(DatabasePool, "initialize", broken_initialize)
 
     # The old code returned {'total': '4975.50', 'count': 4}: tenant-a's prop-002 figures.
-    with pytest.raises(Exception):
+    with pytest.raises(Exception, match="Database pool not available"):
         asyncio.run(calculate_total_revenue("prop-002", "tenant-b"))
 
 
