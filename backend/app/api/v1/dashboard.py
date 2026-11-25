@@ -14,7 +14,11 @@ async def get_dashboard_summary(
     
     tenant_id = getattr(current_user, "tenant_id", "default_tenant") or "default_tenant"
     
-    revenue_data = await get_revenue_summary(property_id, tenant_id)
+    try:
+        revenue_data = await get_revenue_summary(property_id, tenant_id)
+    except Exception:
+        # Already logged by the service. Show an error, never fake or stale numbers.
+        raise HTTPException(status_code=503, detail="Revenue data temporarily unavailable")
     
     # Amounts are stored with 3 decimals. Round once, on the exact Decimal, to cents
     # (half-up) before it becomes a JSON number; float(...) first would turn
