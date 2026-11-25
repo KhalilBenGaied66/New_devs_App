@@ -38,6 +38,12 @@ docker compose exec backend python -m pytest
 - **Fix:** `dashboard.py` rounds the exact `Decimal` total once, to cents, half-up (`quantize(Decimal("0.01"), ROUND_HALF_UP)`), and only then converts it for JSON. The response field stays a number, so the frontend is unchanged.
 - **Proof:** `tests/test_dashboard_rounding.py` (unit test, auth and revenue service faked): on the original code 2 of 4 cases fail (`1000.005` is sent raw instead of `1000.01`; `4975.504` instead of `4975.50`); with the fix all pass. Live, all six properties match the seed sums (Sunset 2250.00 / 4975.50 / 6100.50; Ocean 0.00 / 1776.50 / 3256.00).
 
+### 4. Database errors were hidden behind mock revenue, including another tenant's figures (FIXED)
+- **Found by:** while reproducing the complaints, both clients saw `1000.0 / 3` for `prop-001` (bug 0). Tracing where that number came from led to the `except` block of `calculate_total_revenue` in `services/reservations.py`: on **any** error it returned a hard-coded table keyed only by property ID. Its `prop-002` row (4975.50 / 4) is Sunset's real total, so Ocean opening `prop-002` during a DB problem saw Sunset's revenue.
+- **Root cause:** test-time mock data left in the production error path. It turns an outage into silently wrong numbers (Client A's complaint) and cross-tenant numbers (Client B's complaint), and it hid bug 0.
+- **Fix:** the service logs the error with `logger.exception(...)` (module logger, instead of `print`) and re-raises; the endpoint (`dashboard.py`, which already imported `HTTPException`) answers **503 "Revenue data temporarily unavailable"**. The frontend already shows "Failed to load revenue data" on errors. A failure is never cached, because the exception happens before the cache write.
+- **Proof:** `tests/test_revenue_errors.py`: on the original code both tests fail (service returned the mock: "DID NOT RAISE"; endpoint crashed with a 500); with the fix both pass. Live: stopped the DB, Ocean `prop-002` → `HTTP 503`, no figures; started the DB again → `0.00`, HTTP 200.
+
 ## Change log (every file touched)
 | File | What changed | Bug |
 |---|---|---|
@@ -50,6 +56,9 @@ docker compose exec backend python -m pytest
 | `backend/tests/test_monthly_revenue.py` | new: March = 2250.000 incl. res-tz-1, Feb = 0, tenant scope, December rollover | 2 |
 | `backend/app/api/v1/dashboard.py` | `float(total)` → `Decimal(total).quantize(0.01, ROUND_HALF_UP)`, then to JSON number | 3 |
 | `backend/tests/test_dashboard_rounding.py` | new: half-cent totals round up, exact totals unchanged | 3 |
+| `backend/app/services/reservations.py` | `calculate_total_revenue`: mock-data fallback removed; logs with module `logger` and re-raises | 4 |
+| `backend/app/api/v1/dashboard.py` | service error → `HTTPException(503)` | 4 |
+| `backend/tests/test_revenue_errors.py` | new: service raises instead of mocking; endpoint returns 503 with no figures | 4 |
 | `NOTES.md` | this file | all |
 
 ## Decisions (one line each)
@@ -58,15 +67,13 @@ docker compose exec backend python -m pytest
 - Follow the repo's conventions: tests in `backend/tests/test_*.py` (pyproject `testpaths`, pre-commit `name-tests-test`), ruff, conventional commit messages (`fix: ...`).
 - Assignment says "do NOT rebuild, use existing patterns": every fix is the smallest change to existing code.
 - Did **not** add a property-ownership check (404) to the dashboard endpoint: new logic, and not needed once the DB works, because the existing SQL already filters by `tenant_id`. Ocean asking for `prop-002` gets its own 0, not Sunset's figure.
+- Errors: 503 (temporary, retry later) rather than 500 or a fallback value; for financial figures, no number is better than a wrong one. The service raises, the API layer decides the HTTP status.
 - Rounding: half-up to cents, once, on the server (the usual rule for invoices); the frontend's own `Math.round` is left as is, since it now only ever receives 2-decimal values.
 - Tests for bugs 0–2 are integration tests against the compose services (no new test dependencies added to the repo); pytest installed in the container only to run them.
 
 ## Other risks noticed
-Planned next (real bugs in existing code, small fixes):
-- `calculate_total_revenue` swallows every DB error and returns hard-coded mock numbers (with another tenant's figures for some IDs), so a DB outage shows wrong data as if real. This is what hid bug 0.
-- A new DB engine is created on every request (`DatabasePool()` inside `calculate_total_revenue`) and never closed, instead of reusing the global pool: connections leak under load.
-
 Not fixed, on purpose:
+- A new DB engine is created on every request (`DatabasePool()` inside `calculate_total_revenue` / `calculate_monthly_revenue`) and never disposed, instead of reusing the global `db_pool`. **Measured:** 40 uncached dashboard requests took Postgres connections from 1 to 6 (limit 100), and the garbage collector cleans the engines up, so nothing visibly breaks. **Why not:** wasteful but not a client-facing bug, and the change touches every DB call (a shared engine is tied to one event loop), so it is a refactor to do with care, not in a bug-fix pass. Next step: initialise the global pool once at app startup and reuse it.
 - Frontend `Dashboard.tsx` hard-codes all 5 properties (with tenant-a's names) for every client. **Why not:** a real fix needs a new "list my properties" endpoint and frontend work, which is a feature, not a bug fix ("do NOT rebuild"). No longer a leak, since the backend now filters by tenant.
 - Currency is hard-coded to `"USD"`, while reservations have a `currency` column. **Why not:** every seed booking is USD, so nothing is wrong today; how to total mixed currencies (convert, or group by currency) is a product decision for the team, not a guess to make in a bug fix.
 - The frontend sends an `X-Simulated-Tenant` header that no backend code reads. **Why not:** dead code, no effect; removing it is cleanup, not a fix.
