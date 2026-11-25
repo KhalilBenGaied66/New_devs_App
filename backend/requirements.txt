@@ -4,6 +4,7 @@ aioredis>=2.0.0
 cachetools==6.2.0
 cryptography>=41.0.0
 fastapi
+greenlet
 httpx>=0.24.0
 lz4
 orjson
